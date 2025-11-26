@@ -1,10 +1,8 @@
 """Core analysis engine for detecting synthetic/honeypot Terraform configurations."""
 import re
-import json
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Any
 from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import hcl2
 
@@ -149,7 +147,7 @@ class TerraformAnalyzer:
         try:
             parsed = hcl2.loads(content)
         except Exception as e:
-            raise ValueError(f"Failed to parse {path}: {e}")
+            raise ValueError(f"Failed to parse {path}: {e}") from e
 
         # Extract resources
         for resource in parsed.get("resource", []):
@@ -364,7 +362,7 @@ class TerraformAnalyzer:
 
         # Check AZ distribution
         az_resources = []
-        for resource_type, resources in self.resources.items():
+        for _resource_type, resources in self.resources.items():
             for r in resources:
                 if isinstance(r["config"], dict):
                     az = r["config"].get("availability_zone", "")
@@ -656,7 +654,7 @@ class TerraformAnalyzer:
             tag_keys_per_resource = [set(t.keys()) if isinstance(t, dict) else set() for t in self.all_tags]
             if tag_keys_per_resource:
                 # Check if all resources have identical tag keys
-                if len(set(frozenset(tk) for tk in tag_keys_per_resource)) == 1:
+                if len({frozenset(tk) for tk in tag_keys_per_resource}) == 1:
                     flags.append(Flag(
                         category="Configuration Entropy",
                         name="Uniform Tag Keys",

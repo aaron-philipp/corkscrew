@@ -5,14 +5,13 @@ import sys
 from pathlib import Path
 
 import click
+from rich import box
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich import box
+from rich.table import Table
 
-from .analyzer import TerraformAnalyzer, AnalysisResult
-
+from .analyzer import AnalysisResult, TerraformAnalyzer
 
 # Fix Windows console encoding issues
 if sys.platform == "win32":
@@ -54,7 +53,7 @@ def render_result(result: AnalysisResult, verbose: bool = False) -> None:
         f"[{score_color}]{verdict}[/{score_color}]\n\n"
         f"Confidence: [bold]{result.confidence.upper()}[/bold]",
         title="[bold white]🤖 CorkScrew Analysis[/bold white]",
-        subtitle=f"[dim]AWS Terraform Synthetic Network Detector[/dim]",
+        subtitle="[dim]AWS Terraform Synthetic Network Detector[/dim]",
         box=box.DOUBLE,
     ))
 
@@ -155,7 +154,7 @@ def main(path: str, verbose: bool, output_json: bool, quiet: bool) -> None:
 
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
-        raise SystemExit(1)
+        raise SystemExit(1) from e
 
     # Output based on format
     if quiet:
