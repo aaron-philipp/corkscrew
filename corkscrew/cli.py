@@ -41,19 +41,31 @@ def get_severity_indicator(severity: float) -> str:
     return "[green]●○○[/green]"
 
 
+def get_provider_display(provider: str) -> str:
+    """Return provider display string with color."""
+    provider_map = {
+        "aws": "[orange1]AWS[/orange1]",
+        "gcp": "[blue]GCP[/blue]",
+        "multi": "[magenta]Multi-Cloud[/magenta]",
+        "unknown": "[dim]Unknown[/dim]",
+    }
+    return provider_map.get(provider, provider)
+
+
 def render_result(result: AnalysisResult, verbose: bool = False) -> None:
     """Render analysis result to console."""
     # Header with score
     score_color = get_score_color(result.synthetic_score)
 
     verdict = result.to_dict()["verdict"]
+    provider_display = get_provider_display(result.provider)
     console.print()
     console.print(Panel(
         f"[bold {score_color}]Synthetic Score: {result.synthetic_score:.1f}/100[/bold {score_color}]\n\n"
         f"[{score_color}]{verdict}[/{score_color}]\n\n"
-        f"Confidence: [bold]{result.confidence.upper()}[/bold]",
+        f"Provider: {provider_display}  |  Confidence: [bold]{result.confidence.upper()}[/bold]",
         title="[bold white]🤖 CorkScrew Analysis[/bold white]",
-        subtitle="[dim]AWS Terraform Synthetic Network Detector[/dim]",
+        subtitle="[dim]Terraform Synthetic Network Detector[/dim]",
         box=box.DOUBLE,
     ))
 
@@ -118,10 +130,12 @@ def render_result(result: AnalysisResult, verbose: bool = False) -> None:
 @click.option("-q", "--quiet", is_flag=True, help="Only output the score (for scripting)")
 def main(path: str, verbose: bool, output_json: bool, quiet: bool) -> None:
     """
-    🍷 CorkScrew - AWS Terraform Synthetic Network Detector
+    🤖 CorkScrew - Terraform Synthetic Network Detector
 
     Analyzes Terraform configurations to detect if they represent
     synthetic/honeypot infrastructure vs organic, production systems.
+
+    Supports AWS and GCP resources with automatic provider detection.
 
     PATH can be a single .tf file or a directory containing .tf files.
 

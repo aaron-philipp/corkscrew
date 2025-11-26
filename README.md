@@ -1,8 +1,10 @@
 # CorkScrew
 
-**AWS Terraform Synthetic Network Detector**
+**Terraform Synthetic Network Detector**
 
-CorkScrew analyzes Terraform configurations to detect whether AWS infrastructure is synthetically generated (honeypots, deception environments, lab setups) versus organically grown production systems.
+CorkScrew analyzes Terraform configurations to detect whether cloud infrastructure is synthetically generated (honeypots, deception environments, lab setups) versus organically grown production systems.
+
+Supports **AWS** and **GCP** with automatic provider detection.
 
 ## Why CorkScrew?
 
@@ -113,8 +115,8 @@ CorkScrew analyzes seven categories of indicators:
 ║                                                                          ║
 ║ PROBABLE SYNTHETIC                                                       ║
 ║                                                                          ║
-║ Confidence: HIGH                                                         ║
-╚═════════════════ AWS Terraform Synthetic Network Detector ═══════════════╝
+║ Provider: AWS  |  Confidence: HIGH                                       ║
+╚════════════════ Terraform Synthetic Network Detector ════════════════════╝
 
                           Category Breakdown
 ┌───────────────────────┬───────┬───────┬─────────────────────────────┐
@@ -146,6 +148,7 @@ CorkScrew analyzes seven categories of indicators:
   "synthetic_score": 67.7,
   "confidence": "high",
   "verdict": "PROBABLE SYNTHETIC",
+  "provider": "aws",
   "categories": [
     {
       "name": "Naming Patterns",
@@ -177,13 +180,23 @@ CorkScrew analyzes seven categories of indicators:
 - Python 3.9+
 - Dependencies: `click`, `rich`, `python-hcl2`
 
+## Supported Providers
+
+| Provider | Status | Resources |
+|----------|--------|-----------|
+| AWS | ✅ Full | VPC, Subnets, Security Groups, EC2, NAT, Flow Logs, IAM, VPC Endpoints, Peering, Load Balancers |
+| GCP | ✅ Full | VPC Networks, Subnetworks, Firewall Rules, Compute Instances, Cloud NAT, Flow Logs, IAM, Service Networking, Peering, Load Balancers |
+| Azure | 🔜 Planned | - |
+
+Provider is auto-detected based on resource type prefixes (`aws_*` vs `google_*`).
+
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 Areas of interest:
 - Additional detection heuristics
-- Support for other cloud providers (Azure, GCP)
+- Support for Azure
 - Support for other IaC tools (CloudFormation, Pulumi)
 - Machine learning-based detection
 

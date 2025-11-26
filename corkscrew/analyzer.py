@@ -35,6 +35,7 @@ class AnalysisResult:
     """Complete analysis result."""
     synthetic_score: float  # 0-100, higher = more likely synthetic
     confidence: str  # low, medium, high
+    provider: str  # aws, gcp, multi, unknown
     categories: list[CategoryScore] = field(default_factory=list)
     summary: str = ""
 
@@ -42,6 +43,7 @@ class AnalysisResult:
         return {
             "synthetic_score": round(self.synthetic_score, 1),
             "confidence": self.confidence,
+            "provider": self.provider,
             "verdict": self._get_verdict(),
             "categories": [
                 {
@@ -76,6 +78,51 @@ class AnalysisResult:
 class TerraformAnalyzer:
     """Analyzes Terraform configurations for synthetic/honeypot indicators."""
 
+    # Resource type mappings: category -> (AWS types, GCP types)
+    RESOURCE_MAPPINGS = {
+        "vpc": (["aws_vpc"], ["google_compute_network"]),
+        "subnet": (["aws_subnet"], ["google_compute_subnetwork"]),
+        "instance": (
+            ["aws_instance", "aws_launch_template"],
+            ["google_compute_instance", "google_compute_instance_template"]
+        ),
+        "security_group": (
+            ["aws_security_group"],
+            ["google_compute_firewall"]
+        ),
+        "nat": (
+            ["aws_nat_gateway", "aws_eip"],
+            ["google_compute_router_nat", "google_compute_router"]
+        ),
+        "flow_log": (
+            ["aws_flow_log"],
+            ["google_compute_subnetwork"]  # GCP uses log_config in subnetwork
+        ),
+        "monitoring": (
+            ["aws_cloudwatch_log_group", "aws_cloudwatch_metric_alarm", "aws_cloudwatch_dashboard"],
+            ["google_logging_metric", "google_monitoring_alert_policy", "google_monitoring_dashboard",
+             "google_logging_project_sink"]
+        ),
+        "vpc_endpoint": (
+            ["aws_vpc_endpoint"],
+            ["google_compute_global_address", "google_service_networking_connection"]
+        ),
+        "iam": (
+            ["aws_iam_role", "aws_iam_policy", "aws_iam_instance_profile"],
+            ["google_service_account", "google_project_iam_member", "google_project_iam_binding",
+             "google_service_account_iam_member"]
+        ),
+        "peering": (
+            ["aws_vpc_peering_connection", "aws_ec2_transit_gateway"],
+            ["google_compute_network_peering", "google_compute_interconnect_attachment"]
+        ),
+        "load_balancer": (
+            ["aws_lb", "aws_alb", "aws_elb"],
+            ["google_compute_forwarding_rule", "google_compute_target_pool",
+             "google_compute_backend_service", "google_compute_url_map"]
+        ),
+    }
+
     # Patterns that suggest organic infrastructure
     ORGANIC_NAME_PATTERNS = [
         r'old[-_]',
@@ -105,6 +152,7 @@ class TerraformAnalyzer:
         r'^server[-_]\d+$',
         r'^instance[-_]\d+$',
         r'^node[-_]\d+$',
+        r'^vm[-_]\d+$',
     ]
 
     # Ticket reference patterns (organic signal)
@@ -124,6 +172,7 @@ class TerraformAnalyzer:
         self.all_tags: list[dict] = []
         self.raw_content: str = ""
         self.files_parsed: int = 0
+        self.detected_provider: str = "unknown"
 
     def parse_directory(self, path: Path) -> None:
         """Parse all .tf files in a directory."""
@@ -134,9 +183,12 @@ class TerraformAnalyzer:
         for tf_file in tf_files:
             self._parse_file(tf_file)
 
+        self._detect_provider()
+
     def parse_file(self, path: Path) -> None:
         """Parse a single .tf file."""
         self._parse_file(path)
+        self._detect_provider()
 
     def _parse_file(self, path: Path) -> None:
         """Internal method to parse a Terraform file."""
@@ -160,9 +212,12 @@ class TerraformAnalyzer:
                         "config": config
                     })
                     self.all_names.append(name)
-                    # Extract tags
-                    if isinstance(config, dict) and "tags" in config:
-                        self.all_tags.append(config["tags"])
+                    # Extract tags (AWS uses 'tags', GCP uses 'labels')
+                    if isinstance(config, dict):
+                        if "tags" in config:
+                            self.all_tags.append(config["tags"])
+                        if "labels" in config:
+                            self.all_tags.append(config["labels"])
 
         # Extract variables
         for var in parsed.get("variable", []):
@@ -171,6 +226,34 @@ class TerraformAnalyzer:
         # Extract locals
         for local in parsed.get("locals", []):
             self.locals.update(local)
+
+    def _detect_provider(self) -> None:
+        """Detect which cloud provider(s) are being used."""
+        resource_types = set(self.resources.keys())
+
+        has_aws = any(rt.startswith("aws_") for rt in resource_types)
+        has_gcp = any(rt.startswith("google_") for rt in resource_types)
+
+        if has_aws and has_gcp:
+            self.detected_provider = "multi"
+        elif has_aws:
+            self.detected_provider = "aws"
+        elif has_gcp:
+            self.detected_provider = "gcp"
+        else:
+            self.detected_provider = "unknown"
+
+    def _get_resources_by_category(self, category: str) -> list[dict]:
+        """Get all resources matching a category across providers."""
+        aws_types, gcp_types = self.RESOURCE_MAPPINGS.get(category, ([], []))
+        resources = []
+        for rt in aws_types + gcp_types:
+            resources.extend(self.resources.get(rt, []))
+        return resources
+
+    def _has_resource_category(self, category: str) -> bool:
+        """Check if any resources exist for a category."""
+        return len(self._get_resources_by_category(category)) > 0
 
     def analyze(self) -> AnalysisResult:
         """Run full analysis and return results."""
@@ -216,6 +299,7 @@ class TerraformAnalyzer:
         result = AnalysisResult(
             synthetic_score=synthetic_score,
             confidence=confidence,
+            provider=self.detected_provider,
             categories=categories,
         )
         result.summary = self._generate_summary(result)
@@ -297,10 +381,16 @@ class TerraformAnalyzer:
         score = 0
         max_score = 100
 
-        # Check subnet configurations
-        subnets = self.resources.get("aws_subnet", [])
+        # Check subnet configurations (AWS and GCP)
+        subnets = self._get_resources_by_category("subnet")
         if len(subnets) >= 2:
-            cidr_blocks = [s["config"].get("cidr_block", "") for s in subnets if isinstance(s["config"], dict)]
+            # AWS uses cidr_block, GCP uses ip_cidr_range
+            cidr_blocks = []
+            for s in subnets:
+                if isinstance(s["config"], dict):
+                    cidr = s["config"].get("cidr_block") or s["config"].get("ip_cidr_range", "")
+                    if cidr:
+                        cidr_blocks.append(cidr)
 
             # Check for perfect CIDR allocation
             cidr_sizes = [self._get_cidr_size(c) for c in cidr_blocks if c]
@@ -325,15 +415,16 @@ class TerraformAnalyzer:
                 ))
                 score += 25
 
-        # Check security group symmetry
-        sgs = self.resources.get("aws_security_group", [])
+        # Check security group/firewall symmetry
+        sgs = self._get_resources_by_category("security_group")
         if len(sgs) >= 2:
             rule_counts = []
             for sg in sgs:
                 config = sg["config"]
                 if isinstance(config, dict):
-                    ingress = len(config.get("ingress", []))
-                    egress = len(config.get("egress", []))
+                    # AWS: ingress/egress, GCP: allow/deny
+                    ingress = len(config.get("ingress", []) or config.get("allow", []))
+                    egress = len(config.get("egress", []) or config.get("deny", []))
                     rule_counts.append((ingress, egress))
 
             if rule_counts and len(set(rule_counts)) == 1:
@@ -341,31 +432,39 @@ class TerraformAnalyzer:
                     category="Resource Symmetry",
                     name="Identical Security Group Structure",
                     severity=0.6,
-                    description="All security groups have identical rule counts - organic SGs accumulate exceptions",
-                    evidence=[f"All SGs have {rule_counts[0][0]} ingress, {rule_counts[0][1]} egress rules"]
+                    description="All security groups/firewalls have identical rule counts",
+                    evidence=[f"All have {rule_counts[0][0]} ingress/allow, {rule_counts[0][1]} egress/deny rules"]
                 ))
                 score += 25
 
         # Check instance type distribution
-        instances = self.resources.get("aws_instance", [])
+        instances = self._get_resources_by_category("instance")
         if len(instances) >= 3:
-            instance_types = [i["config"].get("instance_type", "") for i in instances if isinstance(i["config"], dict)]
-            if len(set(instance_types)) == 1:
+            instance_types = []
+            for i in instances:
+                if isinstance(i["config"], dict):
+                    # AWS: instance_type, GCP: machine_type
+                    itype = i["config"].get("instance_type") or i["config"].get("machine_type", "")
+                    if itype:
+                        instance_types.append(itype)
+
+            if instance_types and len(set(instance_types)) == 1:
                 flags.append(Flag(
                     category="Resource Symmetry",
                     name="Uniform Instance Types",
                     severity=0.5,
-                    description="All instances use identical instance type - organic environments are heterogeneous",
+                    description="All instances use identical instance/machine type",
                     evidence=[f"All instances are {instance_types[0]}"]
                 ))
                 score += 20
 
-        # Check AZ distribution
+        # Check AZ/Zone distribution
         az_resources = []
         for _resource_type, resources in self.resources.items():
             for r in resources:
                 if isinstance(r["config"], dict):
-                    az = r["config"].get("availability_zone", "")
+                    # AWS: availability_zone, GCP: zone
+                    az = r["config"].get("availability_zone") or r["config"].get("zone", "")
                     if az:
                         az_resources.append(az)
 
@@ -374,9 +473,9 @@ class TerraformAnalyzer:
             if len(set(az_counts.values())) == 1 and len(az_counts) > 1:
                 flags.append(Flag(
                     category="Resource Symmetry",
-                    name="Perfect AZ Balance",
+                    name="Perfect AZ/Zone Balance",
                     severity=0.4,
-                    description="Resources perfectly balanced across AZs - organic deployment drifts",
+                    description="Resources perfectly balanced across AZs/zones - organic deployment drifts",
                     evidence=[f"{az}: {count}" for az, count in az_counts.items()]
                 ))
                 score += 15
@@ -399,7 +498,6 @@ class TerraformAnalyzer:
         for pattern in timestamp_patterns:
             matches = re.findall(pattern, self.raw_content)
             if matches:
-                # Check if all timestamps are very similar (within same day/hour)
                 timestamp_evidence.extend(matches[:5])
 
         # Check for identical timestamps suggesting batch creation
@@ -462,7 +560,6 @@ class TerraformAnalyzer:
             score += 25
 
         # Check for terraform state artifacts that suggest fresh creation
-        # Look for resource addresses that suggest no refactoring history
         moved_blocks = re.findall(r'moved\s*\{', self.raw_content)
         import_blocks = re.findall(r'import\s*\{', self.raw_content)
 
@@ -476,8 +573,8 @@ class TerraformAnalyzer:
             ))
             score += 15
 
-        # Check for creation timestamp in tags
-        creation_tags = ['CreatedAt', 'CreatedOn', 'CreateDate', 'created_at', 'created_on']
+        # Check for creation timestamp in tags/labels
+        creation_tags = ['CreatedAt', 'CreatedOn', 'CreateDate', 'created_at', 'created_on', 'creation_timestamp']
         has_creation_tags = any(
             any(tag in str(t) for tag in creation_tags)
             for t in self.all_tags
@@ -501,15 +598,15 @@ class TerraformAnalyzer:
         score = 0
         max_score = 100
 
-        resource_types = set(self.resources.keys())
-        has_vpc = "aws_vpc" in resource_types
-        has_instances = "aws_instance" in resource_types or "aws_launch_template" in resource_types
+        has_vpc = self._has_resource_category("vpc")
+        has_instances = self._has_resource_category("instance")
 
         if not has_vpc and not has_instances:
             return CategoryScore("Structural Realism", 0, max_score, flags)
 
         # Check for missing bastion/jump hosts
-        instance_names = [i["name"].lower() for i in self.resources.get("aws_instance", [])]
+        instances = self._get_resources_by_category("instance")
+        instance_names = [i["name"].lower() for i in instances]
         has_bastion = any(
             "bastion" in n or "jump" in n or "ssh" in n
             for n in instance_names
@@ -524,106 +621,108 @@ class TerraformAnalyzer:
             ))
             score += 20
 
-        # Check for NAT Gateway
-        has_nat = "aws_nat_gateway" in resource_types or "aws_eip" in resource_types
+        # Check for NAT Gateway/Cloud NAT
+        has_nat = self._has_resource_category("nat")
         if has_vpc and not has_nat:
             flags.append(Flag(
                 category="Structural Realism",
-                name="No NAT Gateway",
+                name="No NAT Gateway/Cloud NAT",
                 severity=0.4,
-                description="No NAT gateway for private subnet internet access",
-                evidence=["Missing aws_nat_gateway or aws_eip resources"]
+                description="No NAT for private subnet internet access",
+                evidence=["Missing NAT gateway resources"]
             ))
             score += 15
 
-        # Check for VPC Flow Logs
-        has_flow_logs = "aws_flow_log" in resource_types
+        # Check for VPC Flow Logs / GCP VPC Flow Logs
+        has_flow_logs = self._has_resource_category("flow_log")
+        # For GCP, also check if subnets have log_config
+        if self.detected_provider == "gcp":
+            for subnet in self._get_resources_by_category("subnet"):
+                if isinstance(subnet["config"], dict) and "log_config" in subnet["config"]:
+                    has_flow_logs = True
+                    break
+
         if has_vpc and not has_flow_logs:
             flags.append(Flag(
                 category="Structural Realism",
                 name="No VPC Flow Logs",
                 severity=0.4,
                 description="No flow logs configured - standard for security monitoring",
-                evidence=["Missing aws_flow_log resource"]
+                evidence=["Missing flow log configuration"]
             ))
             score += 15
 
-        # Check for CloudWatch resources
-        has_monitoring = any(
-            rt in resource_types
-            for rt in ["aws_cloudwatch_log_group", "aws_cloudwatch_metric_alarm", "aws_cloudwatch_dashboard"]
-        )
+        # Check for CloudWatch / Stackdriver monitoring
+        has_monitoring = self._has_resource_category("monitoring")
         if has_instances and not has_monitoring:
             flags.append(Flag(
                 category="Structural Realism",
-                name="No CloudWatch Monitoring",
+                name="No Cloud Monitoring",
                 severity=0.5,
-                description="No CloudWatch logs or alarms - unusual for production",
-                evidence=["Missing CloudWatch resources"]
+                description="No monitoring/logging resources - unusual for production",
+                evidence=["Missing monitoring resources"]
             ))
             score += 20
 
-        # Check for VPC Endpoints
-        has_endpoints = "aws_vpc_endpoint" in resource_types
+        # Check for VPC Endpoints / Private Service Connect
+        has_endpoints = self._has_resource_category("vpc_endpoint")
         if has_vpc and not has_endpoints:
             flags.append(Flag(
                 category="Structural Realism",
-                name="No VPC Endpoints",
+                name="No Private Service Endpoints",
                 severity=0.3,
-                description="No VPC endpoints for AWS services",
-                evidence=["Missing aws_vpc_endpoint resources"]
+                description="No VPC endpoints or private service connections",
+                evidence=["Missing private endpoint resources"]
             ))
             score += 10
 
         # Check for IAM resources
-        has_iam = any(
-            rt in resource_types
-            for rt in ["aws_iam_role", "aws_iam_policy", "aws_iam_instance_profile"]
-        )
+        has_iam = self._has_resource_category("iam")
         if has_instances and not has_iam:
             flags.append(Flag(
                 category="Structural Realism",
                 name="No IAM Configuration",
                 severity=0.6,
-                description="No IAM roles or policies - instances need IAM for AWS API access",
-                evidence=["Missing IAM resources"]
+                description="No IAM roles/service accounts - instances need identity for API access",
+                evidence=["Missing IAM/service account resources"]
             ))
             score += 20
 
-        # Check for cross-account references or peering connections
-        has_peering = "aws_vpc_peering_connection" in resource_types
+        # Check for cross-account/cross-project references or peering connections
+        has_peering = self._has_resource_category("peering")
+        # Check for cross-account ARNs (AWS) or cross-project references (GCP)
         has_cross_account = (
-            "aws_ram_resource_share" in resource_types or
-            re.search(r'arn:aws:[^:]+:[^:]*:\d{12}:', self.raw_content)  # Cross-account ARN
+            re.search(r'arn:aws:[^:]+:[^:]*:\d{12}:', self.raw_content) or  # AWS cross-account ARN
+            re.search(r'projects/[a-z][a-z0-9-]+/', self.raw_content)  # GCP cross-project
         )
-        has_transit_gateway = "aws_ec2_transit_gateway" in resource_types
 
-        if has_vpc and not has_peering and not has_cross_account and not has_transit_gateway:
+        if has_vpc and not has_peering and not has_cross_account:
             flags.append(Flag(
                 category="Structural Realism",
-                name="No Cross-Account/Peering",
+                name="No Cross-Account/Cross-Project",
                 severity=0.4,
-                description="No VPC peering or cross-account references - enterprise networks are interconnected",
-                evidence=["No aws_vpc_peering_connection, transit gateway, or cross-account ARNs found"]
+                description="No VPC peering or cross-account/project references - enterprise networks are interconnected",
+                evidence=["No peering connections or cross-account/project references found"]
             ))
             score += 15
 
-        # Check for too-clean security groups (no accumulated exceptions)
-        sgs = self.resources.get("aws_security_group", [])
+        # Check for too-clean security groups/firewalls
+        sgs = self._get_resources_by_category("security_group")
         if sgs:
-            # Check for signs of organic SG growth: varied port ranges, specific IPs, descriptions
             sg_has_organic_signs = False
             for sg in sgs:
                 config = sg["config"]
                 if isinstance(config, dict):
+                    # Check AWS ingress rules
                     ingress_rules = config.get("ingress", [])
-                    for rule in ingress_rules if isinstance(ingress_rules, list) else []:
+                    # Check GCP allow rules
+                    allow_rules = config.get("allow", [])
+
+                    for rule in (ingress_rules if isinstance(ingress_rules, list) else []):
                         if isinstance(rule, dict):
-                            # Organic signs: specific CIDR (not 0.0.0.0/0), description, unusual ports
                             cidr = rule.get("cidr_blocks", [])
                             desc = rule.get("description", "")
                             from_port = rule.get("from_port", 0)
-                            # Check for non-standard ports or specific CIDRs
                             if desc and len(desc) > 10:
                                 sg_has_organic_signs = True
                             if isinstance(cidr, list) and cidr and "0.0.0.0/0" not in cidr:
@@ -631,12 +730,18 @@ class TerraformAnalyzer:
                             if from_port and from_port not in [22, 80, 443, 3306, 5432, 6379, 8080]:
                                 sg_has_organic_signs = True
 
+                    for rule in (allow_rules if isinstance(allow_rules, list) else []):
+                        if isinstance(rule, dict):
+                            ports = rule.get("ports", [])
+                            if ports and any(p not in ["22", "80", "443", "3306", "5432"] for p in ports):
+                                sg_has_organic_signs = True
+
             if not sg_has_organic_signs and len(sgs) > 1:
                 flags.append(Flag(
                     category="Structural Realism",
-                    name="Too-Clean Security Groups",
+                    name="Too-Clean Security Rules",
                     severity=0.5,
-                    description="Security groups lack accumulated exceptions - organic SGs have specific IPs, descriptions, unusual ports",
+                    description="Security groups/firewalls lack accumulated exceptions",
                     evidence=["No specific CIDR restrictions, no detailed descriptions, only standard ports"]
                 ))
                 score += 15
@@ -649,51 +754,50 @@ class TerraformAnalyzer:
         score = 0
         max_score = 100
 
-        # Check tag consistency
+        # Check tag/label consistency
         if self.all_tags:
             tag_keys_per_resource = [set(t.keys()) if isinstance(t, dict) else set() for t in self.all_tags]
             if tag_keys_per_resource:
-                # Check if all resources have identical tag keys
                 if len({frozenset(tk) for tk in tag_keys_per_resource}) == 1:
                     flags.append(Flag(
                         category="Configuration Entropy",
-                        name="Uniform Tag Keys",
+                        name="Uniform Tag/Label Keys",
                         severity=0.5,
-                        description="All resources have identical tag keys - organic tagging is inconsistent",
-                        evidence=[f"All resources use tags: {list(tag_keys_per_resource[0])}"]
+                        description="All resources have identical tag/label keys - organic tagging is inconsistent",
+                        evidence=[f"All resources use: {list(tag_keys_per_resource[0])}"]
                     ))
                     score += 20
 
-                # Check for missing common organic tags
                 all_tag_keys = set()
                 for tk in tag_keys_per_resource:
                     all_tag_keys.update(tk)
 
-                organic_tags = {"Owner", "Team", "CostCenter", "Project", "Environment", "CreatedBy"}
-                missing_organic = organic_tags - all_tag_keys
-                if len(missing_organic) == len(organic_tags) and self.all_tags:
+                # Common organic tags for both AWS and GCP
+                organic_tags = {"Owner", "Team", "CostCenter", "Project", "Environment", "CreatedBy",
+                               "owner", "team", "cost-center", "project", "environment", "created-by"}
+                has_any_organic = bool(organic_tags & all_tag_keys)
+                if not has_any_organic and self.all_tags:
                     flags.append(Flag(
                         category="Configuration Entropy",
                         name="Missing Operational Tags",
                         severity=0.4,
                         description="Missing common operational tags (Owner, Team, CostCenter)",
-                        evidence=[f"None of {organic_tags} found in tags"]
+                        evidence=["No common operational tags found"]
                     ))
                     score += 15
         elif self.resources and sum(len(r) for r in self.resources.values()) > 3:
             flags.append(Flag(
                 category="Configuration Entropy",
-                name="No Tags Present",
+                name="No Tags/Labels Present",
                 severity=0.6,
-                description="No tags on any resources - organic infra has tagging (even if messy)",
-                evidence=["Zero tags found across all resources"]
+                description="No tags/labels on any resources - organic infra has tagging (even if messy)",
+                evidence=["Zero tags/labels found across all resources"]
             ))
             score += 25
 
         # Check for hardcoded IPs (organic signal)
         ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
         hardcoded_ips = re.findall(ip_pattern, self.raw_content)
-        # Filter out common non-routable
         real_ips = [ip for ip in hardcoded_ips if not ip.startswith(("0.", "127.", "255."))]
 
         if not real_ips and len(self.raw_content) > 1000:
@@ -706,44 +810,45 @@ class TerraformAnalyzer:
             ))
             score += 15
 
-        # Check AMI references
+        # Check image references (AMI for AWS, image for GCP)
         ami_refs = re.findall(r'ami-[a-f0-9]+', self.raw_content)
-        if ami_refs:
-            unique_amis = set(ami_refs)
-            if len(unique_amis) == 1 and len(ami_refs) > 2:
+        gcp_image_refs = re.findall(r'projects/[^/]+/global/images/[^\s"]+', self.raw_content)
+        image_refs = ami_refs + gcp_image_refs
+
+        if image_refs:
+            unique_images = set(image_refs)
+            if len(unique_images) == 1 and len(image_refs) > 2:
                 flags.append(Flag(
                     category="Configuration Entropy",
-                    name="Single AMI Across All Instances",
+                    name="Single Image Across All Instances",
                     severity=0.4,
-                    description="All instances use same AMI - organic environments have varied AMIs",
-                    evidence=[f"All instances use {list(unique_amis)[0]}"]
+                    description="All instances use same image - organic environments have varied images",
+                    evidence=[f"All instances use {list(unique_images)[0][:50]}..."]
                 ))
                 score += 15
 
-        # Check region diversity
-        region_refs = re.findall(r'[a-z]{2}-[a-z]+-\d', self.raw_content)
-        if region_refs:
-            unique_regions = set(region_refs)
-            if len(unique_regions) == 1:
-                flags.append(Flag(
-                    category="Configuration Entropy",
-                    name="Single Region Deployment",
-                    severity=0.3,
-                    description="All resources in single region - enterprises typically span regions",
-                    evidence=[f"Only region found: {list(unique_regions)[0]}"]
-                ))
-                score += 10
+        # Check region/location diversity
+        aws_regions = re.findall(r'[a-z]{2}-[a-z]+-\d', self.raw_content)
+        gcp_regions = re.findall(r'[a-z]+-[a-z]+\d', self.raw_content)
+        regions = set(aws_regions + gcp_regions)
+
+        if regions and len(regions) == 1:
+            flags.append(Flag(
+                category="Configuration Entropy",
+                name="Single Region Deployment",
+                severity=0.3,
+                description="All resources in single region - enterprises typically span regions",
+                evidence=[f"Only region found: {list(regions)[0]}"]
+            ))
+            score += 10
 
         return CategoryScore("Configuration Entropy", min(score, max_score), max_score, flags)
 
     def _analyze_organic_signals(self) -> CategoryScore:
         """Look for organic signals that would lower synthetic score."""
         flags = []
-        score = 0
+        score = 80  # Start high, reduce for organic signals
         max_score = 100
-
-        # Start with high score (assuming synthetic) and reduce for organic signals
-        score = 80
 
         # Check for ticket references
         has_tickets = any(
@@ -794,7 +899,7 @@ class TerraformAnalyzer:
         # Check for commented-out code
         commented_code_patterns = [
             r'#\s*resource\s',
-            r'#\s*aws_',
+            r'#\s*(aws_|google_)',
             r'#\s*\w+\s*=',
         ]
         has_commented_code = any(
@@ -812,23 +917,16 @@ class TerraformAnalyzer:
                 evidence=["No commented resource blocks or configurations"]
             ))
 
-        # Check for description fields (organic signal)
+        # Check for description fields
         descriptions = re.findall(r'description\s*=\s*"[^"]{20,}"', self.raw_content)
         if len(descriptions) > 2:
             score -= 10
 
-        # Check for troubleshooting/debug configurations (organic signal)
+        # Check for troubleshooting/debug configurations
         debug_patterns = [
-            r'debug',
-            r'troubleshoot',
-            r'temporary',
-            r'temp[-_]rule',
-            r'allow[-_]all',  # Temporary allow-all rules
-            r'test[-_]',
-            r'testing',
-            r'remove[-_]?later',
-            r'revert',
-            r'hotfix',
+            r'debug', r'troubleshoot', r'temporary', r'temp[-_]rule',
+            r'allow[-_]all', r'test[-_]', r'testing', r'remove[-_]?later',
+            r'revert', r'hotfix',
         ]
         has_debug_config = any(
             re.search(pattern, self.raw_content, re.IGNORECASE)
@@ -836,29 +934,18 @@ class TerraformAnalyzer:
         )
         if has_debug_config:
             score -= 20
-        else:
-            if len(self.resources) > 5:
-                flags.append(Flag(
-                    category="Organic Signals",
-                    name="No Debug/Troubleshooting Artifacts",
-                    severity=0.4,
-                    description="No temporary rules or debug configs - organic infra has troubleshooting remnants",
-                    evidence=["No 'debug', 'temporary', 'test-', 'hotfix' patterns found"]
-                ))
+        elif len(self.resources) > 5:
+            flags.append(Flag(
+                category="Organic Signals",
+                name="No Debug/Troubleshooting Artifacts",
+                severity=0.4,
+                description="No temporary rules or debug configs - organic infra has troubleshooting remnants",
+                evidence=["No 'debug', 'temporary', 'test-', 'hotfix' patterns found"]
+            ))
 
-        # Check for environment-specific overrides (organic signal)
-        env_patterns = [
-            r'override',
-            r'except',
-            r'unless',
-            r'special[-_]?case',
-            r'workaround',
-            r'one[-_]?off',
-        ]
-        has_overrides = any(
-            re.search(pattern, self.raw_content, re.IGNORECASE)
-            for pattern in env_patterns
-        )
+        # Check for environment-specific overrides
+        env_patterns = [r'override', r'except', r'unless', r'special[-_]?case', r'workaround', r'one[-_]?off']
+        has_overrides = any(re.search(pattern, self.raw_content, re.IGNORECASE) for pattern in env_patterns)
         if has_overrides:
             score -= 15
 
@@ -870,7 +957,7 @@ class TerraformAnalyzer:
         score = 0
         max_score = 100
 
-        # Check for lifecycle blocks (organic signal - indicates iteration)
+        # Check for lifecycle blocks
         has_lifecycle = "lifecycle" in self.raw_content
         if not has_lifecycle and len(self.resources) > 5:
             flags.append(Flag(
@@ -882,10 +969,9 @@ class TerraformAnalyzer:
             ))
             score += 15
 
-        # Check for count/for_each (could go either way)
+        # Check for count/for_each
         has_iteration = "count" in self.raw_content or "for_each" in self.raw_content
         if has_iteration:
-            # Check if it's simple sequential iteration
             simple_count = re.findall(r'count\s*=\s*\d+', self.raw_content)
             if simple_count:
                 flags.append(Flag(
@@ -897,7 +983,7 @@ class TerraformAnalyzer:
                 ))
                 score += 20
 
-        # Check for depends_on (organic signal - indicates discovered dependencies)
+        # Check for depends_on
         has_depends = "depends_on" in self.raw_content
         if not has_depends and len(self.resources) > 5:
             flags.append(Flag(
@@ -909,19 +995,19 @@ class TerraformAnalyzer:
             ))
             score += 15
 
-        # Check for data sources (organic signal - reading existing resources)
-        data_sources = re.findall(r'data\s+"aws_', self.raw_content)
+        # Check for data sources
+        data_sources = re.findall(r'data\s+"(aws_|google_)', self.raw_content)
         if not data_sources and len(self.resources) > 3:
             flags.append(Flag(
                 category="Code Artifacts",
                 name="No Data Sources",
                 severity=0.4,
                 description="No data sources - organic configs reference existing resources",
-                evidence=["No data blocks for existing AWS resources"]
+                evidence=["No data blocks for existing resources"]
             ))
             score += 20
 
-        # Check for modules (organic signal - code reuse)
+        # Check for modules
         module_refs = re.findall(r'module\s+"', self.raw_content)
         if not module_refs and len(self.resources) > 10:
             flags.append(Flag(
@@ -934,15 +1020,17 @@ class TerraformAnalyzer:
             score += 15
 
         # Check for provider configuration complexity
-        provider_configs = re.findall(r'provider\s+"aws"', self.raw_content)
-        if len(provider_configs) <= 1:
-            # Check for assume_role (organic signal)
-            if "assume_role" not in self.raw_content:
+        aws_providers = re.findall(r'provider\s+"aws"', self.raw_content)
+        gcp_providers = re.findall(r'provider\s+"google"', self.raw_content)
+        total_providers = len(aws_providers) + len(gcp_providers)
+
+        if total_providers <= 1:
+            if "assume_role" not in self.raw_content and "impersonate_service_account" not in self.raw_content:
                 flags.append(Flag(
                     category="Code Artifacts",
                     name="Simple Provider Config",
                     severity=0.3,
-                    description="No cross-account or assume_role configurations",
+                    description="No cross-account/project or assume_role/impersonation configurations",
                     evidence=["Single simple provider block"]
                 ))
                 score += 10
@@ -953,7 +1041,6 @@ class TerraformAnalyzer:
         """Extract naming format patterns from resource names."""
         formats = {}
         for name in self.all_names:
-            # Normalize to pattern
             pattern = re.sub(r'\d+', 'N', name)
             pattern = re.sub(r'[a-f0-9]{8,}', 'HASH', pattern)
             formats[pattern] = formats.get(pattern, 0) + 1
@@ -964,13 +1051,11 @@ class TerraformAnalyzer:
         if len(self.all_names) < 3:
             return False
 
-        # Check for mixed separators
         has_dash = any('-' in n for n in self.all_names)
         has_underscore = any('_' in n for n in self.all_names)
         if has_dash and has_underscore:
             return True
 
-        # Check for mixed casing patterns
         has_lower = any(n.islower() for n in self.all_names)
         has_mixed = any(not n.islower() and not n.isupper() for n in self.all_names)
         if has_lower and has_mixed:
@@ -993,7 +1078,6 @@ class TerraformAnalyzer:
             return False
 
         try:
-            # Extract the third octet and check for sequence
             octets = []
             for cidr in cidrs:
                 parts = cidr.split('.')
@@ -1002,7 +1086,6 @@ class TerraformAnalyzer:
 
             if len(octets) >= 2:
                 octets.sort()
-                # Check if sequential
                 for i in range(1, len(octets)):
                     if octets[i] - octets[i-1] != 1:
                         return False
@@ -1016,14 +1099,21 @@ class TerraformAnalyzer:
         """Generate a human-readable summary."""
         total_flags = sum(len(cat.flags) for cat in result.categories)
 
+        provider_str = {
+            "aws": "AWS",
+            "gcp": "GCP",
+            "multi": "multi-cloud (AWS + GCP)",
+            "unknown": "unknown provider"
+        }.get(result.provider, result.provider)
+
         if result.synthetic_score >= 75:
-            verdict = "This infrastructure shows strong indicators of being synthetically generated or a honeypot."
+            verdict = f"This {provider_str} infrastructure shows strong indicators of being synthetically generated or a honeypot."
         elif result.synthetic_score >= 50:
-            verdict = "This infrastructure has significant synthetic characteristics but some organic elements."
+            verdict = f"This {provider_str} infrastructure has significant synthetic characteristics but some organic elements."
         elif result.synthetic_score >= 30:
-            verdict = "Mixed signals - some synthetic patterns but also organic characteristics present."
+            verdict = f"Mixed signals in this {provider_str} config - some synthetic patterns but also organic characteristics present."
         else:
-            verdict = "This infrastructure appears to be organically grown with typical operational artifacts."
+            verdict = f"This {provider_str} infrastructure appears to be organically grown with typical operational artifacts."
 
         top_categories = sorted(result.categories, key=lambda c: c.normalized_score, reverse=True)[:3]
         top_concerns = ", ".join(c.name for c in top_categories if c.normalized_score > 30)
